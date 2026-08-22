@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from app.plugins.lunatvsource import LunaTVSource
-from app.plugins.lunatvsource.cms import AppleCmsClient, CmsSource
+from app.plugins.lunatvsource.cms import AppleCmsClient, CmsSource, _result_from_item
 from app.plugins.lunatvsource.downloader import DownloadQueue
 import app.plugins.lunatvsource as plugin_module
 import app.plugins.lunatvsource.downloader as downloader_module
@@ -80,3 +80,60 @@ def test_ffmpeg_explicitly_sets_mp4_muxer_for_part_file(monkeypatch, tmp_path: P
     )
     command = captured["command"]
     assert command[command.index("-f") + 1] == "mp4"
+
+
+def test_native_resource_search_returns_marked_download_items(monkeypatch):
+    class TorrentInfo:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class Client:
+        def search(self, query, **kwargs):
+            return [_result_from_item(
+                CmsSource("demo", "演示源", "https://cms.example/vod", "https://cms.example"),
+                {
+                    "vod_id": "42",
+                    "vod_name": "示例剧",
+                    "vod_year": "2024",
+                    "type_name": "电视剧",
+                    "vod_play_from": "在线播放",
+                    "vod_play_url": "01$https://example.test/01.m3u8",
+                },
+            )]
+
+    monkeypatch.setattr(plugin_module, "_schemas", type("Schemas", (), {"TorrentInfo": TorrentInfo}))
+    plugin = object.__new__(LunaTVSource)
+    plugin._enabled = True
+    plugin._ai = type("Ai", (), {"normalize": lambda self, query, *args: (query, {})})()
+    plugin._logger = type("Logger", (), {"warning": lambda *args: None})()
+    plugin._resource_search_lock = __import__("threading").RLock()
+    plugin._resource_search_cache = {}
+    monkeypatch.setattr(plugin, "_client", lambda: Client())
+    monkeypatch.setattr(plugin, "_host_media_source", lambda: "lunatv")
+    items = plugin.search_torrents(site={"id": 1}, keyword="示例剧", page=0)
+    assert len(items) == 1
+    assert items[0].site_name == "LunaTV"
+    assert items[0].title.endswith("S01E01")
+    assert plugin._decode_resource_token(items[0].enclosure)["url"].endswith("01.m3u8")
+
+
+def test_native_download_is_enqueued_into_serial_queue(tmp_path: Path):
+    data = {}
+    plugin = object.__new__(LunaTVSource)
+    plugin._config = {}
+    plugin._queue = DownloadQueue(data.get, data.__setitem__, lambda *_: None)
+    token = plugin._resource_token({
+        "url": "https://example.test/movie.m3u8",
+        "title": "示例电影",
+        "year": "2024",
+        "media_type": "movie",
+        "season": 1,
+        "episode": 1,
+        "media_id": "demo:42",
+    })
+    result = plugin.download(token, tmp_path)
+    assert result[0] == "LunaTVSource"
+    assert result[1]
+    tasks = plugin._queue.list_tasks()
+    assert len(tasks) == 1
+    assert tasks[0]["url"] == "https://example.test/movie.m3u8"
